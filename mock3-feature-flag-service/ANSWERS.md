@@ -3,9 +3,9 @@
 > **STOP. Do not read this file until your 60-minute timer has ended.**
 > Score yourself first, then read.
 
-Six planted bugs — all logic bugs. The code compiles, runs, and returns
-confident, wrong answers. For each: where, why it's subtle, the fix, what to
-narrate, and the L5-level commentary.
+Five planted bugs for Phase B — all logic bugs. The code compiles, runs, and
+returns confident, wrong answers. For each: where, why it's subtle, the fix,
+what to narrate, and the L5-level commentary. Phase C and D sketches follow.
 
 ---
 
@@ -141,38 +141,7 @@ gap you can explain than a lie you can't.
 
 ---
 
-## Bug 5 — Cache TTL refresh stampede
-
-**Location:** `FlagCache.java:48`
-```java
-boolean value = loader.get();
-```
-
-**Why it's subtle:** The comment is true — `ConcurrentHashMap` *is* safe
-under contention — so the code feels reviewed. Memory-safety isn't the bug:
-every thread that observes an expired entry runs the (potentially expensive)
-loader simultaneously. On every TTL boundary, a hot flag triggers N
-redundant evaluations.
-
-**Ideal fix:** singleflight — one thread computes, the rest wait:
-```java
-private final ConcurrentHashMap<String, FutureTask<Boolean>> inFlight = new ConcurrentHashMap<>();
-// computeIfAbsent a FutureTask per key; losers call .get() on the winner's future
-```
-(or async refresh / stale-while-revalidate / jittered TTLs).
-
-**Narrate aloud:** "The map is thread-safe, but there's no suppression of
-duplicate computation — N threads see the expired entry and all N run the
-loader. That's a stampede on every TTL boundary."
-
-**L5 commentary:** This is Mock 1's cache-aside thundering herd in different
-clothes — recognizing the same bug across codebases is the senior signal.
-Mitigation menu: singleflight, stale-while-revalidate, jittered TTLs so hot
-keys don't expire in lockstep.
-
----
-
-## Bug 6 — Environment override applied last, clobbering request overrides
+## Bug 5 — Environment override applied last, clobbering request overrides
 
 **Location:** `FlagApi.java:50`
 ```java
@@ -206,9 +175,77 @@ durable fix, not just reordering lines.
 
 ---
 
+## Phase C — sketch (sticky gradual rollout + audit-query API)
+
+**Approach:** replace the bucket function with a stable digest of the user-id
+bytes (this is also the natural way to fix Bug 2 — Phase C forces the
+confrontation if you missed it in Phase B). Stickiness across ramps: with
+`bucket = digest % 100`, a user is in the rollout iff `bucket < pct` — as
+`pct` grows, membership only grows; nobody flips. That's the whole trick, and
+saying *why* it holds is the interview signal. For the query API: a
+`queryAudits` taking an immutable filter object (flag, actor, since, until)
+returning a snapshot list — and the discipline to *not* build a query DSL.
+
+**Key trade-offs:** digest choice (SHA-256 is overkill per evaluation —
+`String.hashCode` is actually stable across JVMs and far cheaper; the bug was
+*identity* hash, not `hashCode`. A strong candidate says this out loud).
+Cache interaction: the sticky rollout changes evaluation results, so cached
+entries keyed on the old bucketing must be invalidated on rollout change —
+otherwise "sticky" is a lie for `ttlMs`. The audit trail is in-memory and
+unbounded: a query API makes the growth *visible* instead of fixing it.
+
+**Clarifying questions a strong candidate asks about "flexible filtering":**
+1. "Flexible = which fields — flag, actor, time range, value? And
+   combinations, or single-field filters?"
+2. "Who calls this — a human in an admin UI paginating, or a compliance job
+   sweeping everything? That decides pagination vs. full snapshots."
+3. "Does the query need to see uncommitted/attempted changes, or only
+   committed ones?" (Ties back to Bug 4 — the candidate who asks this is
+   connecting the phases.)
+
+**What good looks like:** asked at least two of the above *before* coding;
+gave the model the precedence chain as a hard constraint; caught the model
+violating precedence or proposing a non-stable bucket; rejected a suggestion
+on the record; ran the 10% → 50% ramp check showing zero flips.
+
+---
+
+## Phase D — sketch ("traffic 10x's overnight")
+
+**What breaks first:** the cache TTL refresh stampede at
+`FlagCache.java:48`. `ConcurrentHashMap` is thread-safe, but nothing
+suppresses duplicate computation: every thread that observes an expired
+entry runs the loader simultaneously. On every TTL boundary, a hot flag
+triggers N redundant evaluations — at 10x traffic with a 5s TTL, that's a
+sawtooth of load spikes, each one a mini-thundering-herd.
+
+**Second:** the poller. It reloads the *entire* config on every tick and
+replaces the map wholesale — at 10x flags, each poll is 10x the garbage and
+10x the parse cost, and every poller wake-up briefly contends on the same
+field readers are hitting.
+
+**The fixes and their trade-offs:** singleflight per key (one thread
+computes, the rest wait on its future); stale-while-revalidate (serve the
+stale value, refresh async — trades freshness for smoothness); jittered TTLs
+(spreads expiry, doesn't remove the herd). For the poller: switch from poll
+to push (or long-poll / watch), or at minimum diff-and-patch instead of
+wholesale replace.
+
+**L5 commentary:** The senior answer starts with detection: evaluation p99
+latency spiking in lockstep with TTL boundaries is the stampede's signature
+— you'd see it in the latency histogram before any error rate moves. Then
+the mitigation menu, then the pattern recognition: this is Mock 1's
+cache-aside herd in different clothes. And the experimentation angle: at 10x
+traffic with Bug 2 unfixed, every redeploy reshuffles experiment buckets —
+your 10x traffic is generating 10x the *corrupted* experiment data.
+
+---
+
 ## Scoring
 
-- 6/6 with concrete triggering inputs: exceptional.
-- 4–5/6: solid pass.
-- ≤3/6: redo Phase 1 with the docs-first discipline. These bugs hide behind
+- 5/5 with concrete triggering inputs: exceptional.
+- 4/5: solid pass.
+- ≤3/5: redo Phase A with the docs-first discipline. These bugs hide behind
   confident comments — the skill is reading the spec before the code.
+- Phase C is graded on process (questions → constraints → rejection →
+  verification), not on finishing. Phase D unfinished is not a fail.

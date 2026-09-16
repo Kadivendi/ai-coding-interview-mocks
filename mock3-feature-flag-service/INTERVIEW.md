@@ -16,42 +16,47 @@ spotting where the code disagrees with its own specification.
 ## Rules
 
 - **60 minutes total**, strict timer. Phases below.
-- **Phase 1: absolutely no AI.**
-- **Phases 2–4: Gemini allowed.**
+- **Phase A: absolutely no AI.**
+- **Phases B–D: AI allowed.** In Phase B, finding the bugs is *your* job —
+  do not prompt "find the bugs".
 - **Narrate aloud constantly.**
 - **Do not open `ANSWERS.md`** until your 60-minute timer ends.
+- **Verification over completion.** Not finishing Phase D is explicitly
+  *not* a fail.
 
 ## Phase timers
 
 | Phase | Time | AI? | Goal |
 |---|---|---|---|
-| 1. Analyze | 0:00–0:20 | No | Write down the evaluation model *from the docs*: rule precedence, rollout semantics, override chain, cache behavior, audit guarantees. Then read the code and mark every place it disagrees with the docs. (20 min — this mock rewards slow reading.) |
-| 2. Collaborate | 0:20–0:32 | Yes | Prompt Gemini to add a kill-switch API that bypasses the cache. Narrate your prompting strategy first. |
-| 3. Validate | 0:32–0:47 | Yes | Verify the AI's kill-switch against the override precedence chain. Then hunt the planted bugs yourself. Target: 4+ of 6 — these are subtle. |
-| 4. Optimize & test | 0:47–1:00 | Yes | Fix **one** bug properly and write a test proving it (e.g. bucket stability across "restarts" using distinct-but-equal `String` instances). |
+| A. Read & map | 0:00–0:10 | No | Write down the evaluation model *from the docs*: rule precedence, rollout semantics, override chain, cache behavior, audit guarantees. Then read the code and mark every place it disagrees with the docs. |
+| B. Fix | 0:10–0:25 | Assisted | Fix the **5 planted bugs** yourself — all logic bugs, so construct the concrete input that produces the wrong answer for each. Target: 4+ of 5. |
+| C. Build | 0:25–0:45 | Yes | Implement **sticky gradual rollout + an audit-query API, with AI** (~80–120 lines, see `TASKS.md`). Give the model the precedence chain as a hard constraint. **Ask clarifying questions about the vague requirement before coding.** |
+| D. Scale | 0:45–1:00 | Optional | Discussion: "traffic 10x's overnight — what breaks first and what do you change?" Name the first bottleneck, the fix, and its tradeoff. |
 
 ## Scoring checklist
 
-**Phase 1 — Comprehension (no AI)**
+**Phase A — Comprehension (no AI)**
 - [ ] Wrote the documented semantics *before* reading the implementation
 - [ ] Found at least one doc-vs-code disagreement from reading alone
 - [ ] Could explain the rollout bucketing scheme's intended stability property
 - [ ] Listed the full override precedence chain from the docs
 
-**Phase 2 — AI fluency**
-- [ ] Stated prompting strategy aloud before prompting
-- [ ] Gave Gemini the precedence chain as a constraint, not a suggestion
-- [ ] Caught Gemini violating (or ignoring) the precedence chain
-
-**Phase 3 — Validation**
-- [ ] Found 4+ of the 6 planted bugs without AI assistance
+**Phase B — Bug fixing**
+- [ ] Found 4+ of the 5 planted bugs without AI finding them for you
 - [ ] For each logic bug, constructed the concrete input that produces the wrong answer
 - [ ] Distinguished "code is wrong" from "docs are wrong" — and said which
 
-**Phase 4 — Rigor**
-- [ ] One bug fixed with real, compiling code
-- [ ] A test that fails before the fix and passes after
-- [ ] Explained the production blast radius of the bug you fixed
+**Phase C — AI fluency (this is the graded skill)**
+- [ ] Asked clarifying questions about the vague requirement *before* writing code
+- [ ] Stated prompting strategy aloud before each prompt
+- [ ] Gave the model the precedence chain and rollout stability as hard constraints
+- [ ] **Rejected at least one AI suggestion with a stated reason**
+- [ ] Compiled and ran a check of AI-generated code before trusting it
+
+**Phase D — Scale thinking**
+- [ ] Named what breaks *first* with a reason tied to the code
+- [ ] Proposed a fix and named its tradeoff
+- [ ] Left Phase D unfinished without guilt
 
 **L5 stretch:** pick any bug and explain how you'd detect it in production
 *without* reading the code — what metric, log, or experiment anomaly would

@@ -3,8 +3,10 @@
 > **STOP. Do not read this file until your 60-minute timer has ended.**
 > Score yourself first, then read.
 
-Seven planted bugs — this mock has one more than the others. For each: where,
-why it's subtle, the fix, what to narrate, and the L5-level commentary.
+Five planted bugs for Phase B — a lifecycle bug, an interrupt bug, a
+shared-state bug, an off-by-one, and a numeric bug that only bites under the
+incident-era config. For each: where, why it's subtle, the fix, what to
+narrate, and the L5-level commentary. Phase C and D sketches follow.
 
 ---
 
@@ -48,164 +50,7 @@ in-flight sends, then exit — tied to a health check. Also note `running` is
 
 ---
 
-## Bug 2 — Backoff shift overflows to negative
-
-**Location:** `RetryPolicy.java:32`
-```java
-return baseDelayMs << attempt;
-```
-
-**Why it's subtle:** `<<` reads as a fast `2^attempt`, and with the default
-mental model of "a handful of retries" it never misbehaves. But the class
-javadoc notes ops raised the ceiling to **100 attempts** — and
-`1000 << 53` exceeds `Long.MAX_VALUE`, wrapping **negative**. `Thread.sleep`
-with a negative argument throws `IllegalArgumentException`, breaking the
-retry loop in a way no test with 3 attempts will ever show.
-
-**Ideal fix:** saturating, capped backoff:
-```java
-private static final long MAX_DELAY_MS = 60_000;
-public long delayForAttempt(int attempt) {
-    long delay = baseDelayMs;
-    for (int i = 0; i < attempt && delay < MAX_DELAY_MS; i++) {
-        delay = Math.min(MAX_DELAY_MS, delay * 2);
-    }
-    return delay;
-}
-```
-
-**Narrate aloud:** "Left shift on a long wraps at 63 bits — past attempt ~53
-this goes negative and `sleep` throws. The incident-era config of 100
-attempts makes this reachable, not theoretical."
-
-**L5 commentary:** Every exponential needs a cap, and usually a *deadline*
-too: bounding attempts without bounding total elapsed time still lets one
-notification occupy a worker for hours. Ask: what's the worst-case time a
-single notification can hold a worker?
-
----
-
-## Bug 3 — No jitter: coordinated retry stampede
-
-**Location:** `RetryPolicy.java:41`
-```java
-Thread.sleep(delayForAttempt(attempt));
-```
-
-**Why it's subtle:** The comment frames the fixed schedule as a virtue —
-"deterministic and easy to reason about in dashboards". But 16 workers that
-failed together sleep the *identical* duration and wake in lockstep, hammering
-a recovering provider with a synchronized wave. Deterministic retries are how
-you DDoS yourself after someone else's outage.
-
-**Ideal fix:** equal jitter (AWS-architecture-blog style):
-```java
-long delay = delayForAttempt(attempt);
-long sleep = delay / 2 + ThreadLocalRandom.current().nextLong(delay / 2 + 1);
-Thread.sleep(sleep);
-```
-
-**Narrate aloud:** "All 16 workers sleep the exact same duration, so they wake
-and hit the provider in lockstep — a self-inflicted thundering herd aimed at
-a provider that's already down."
-
-**L5 commentary:** This is the highest-leverage one-line class of fix in
-distributed systems. The senior version of this answer cites decorrelated
-jitter and explains *why* the provider's recovery curve demands it: without
-jitter, your retry policy and the provider's recovery are phase-locked.
-
----
-
-## Bug 4 — HashMap shared across threads (the dedup that doesn't)
-
-**Location:** `DedupStore.java:23`
-```java
-return seen.containsKey(id);
-```
-
-**Why it's subtle:** `markSent` *is* synchronized, and the comment
-rationalizes the unlocked read ("reads don't mutate"). Single-threaded tests
-pass. But `HashMap` is unsafe for *any* concurrent read/write mix: a `put`
-that triggers a resize while another thread reads can loop forever or corrupt
-the table. Worst case, the failure mode is **duplicate sends** — precisely the
-invariant this class exists to protect.
-
-**Ideal fix:** `private final Map<String, Long> seen = new ConcurrentHashMap<>();`
-(or synchronize the read — but CHM is the idiomatic answer).
-
-**Narrate aloud:** "Synchronizing only the writer doesn't help — HashMap
-isn't safe for concurrent read/write at all. A resize during a read can spin
-forever, and the failure mode is duplicate sends."
-
-**L5 commentary:** Concurrency bugs that defeat a component's *raison d'être*
-are the most expensive kind. The pattern to internalize: when the comment
-explains why the lock *isn't* needed, that's exactly where to look hardest.
-
----
-
-## Bug 5 — Unbounded queue, fictional backpressure
-
-**Location:** `WorkQueue.java:37`
-```java
-private final BlockingQueue<Notification> queue = new LinkedBlockingQueue<>();
-```
-
-**Why it's subtle:** `LinkedBlockingQueue` *sounds* bounded-capable, the
-comment describes blocking producers, and `put()` (which blocks *if* bounded)
-is used. But the no-arg constructor means `Integer.MAX_VALUE` capacity —
-`put` never blocks. Under a slow provider, producers enqueue forever until
-the heap dies.
-
-**Ideal fix:** bound it and choose the overflow policy explicitly:
-```java
-private final BlockingQueue<Notification> queue = new LinkedBlockingQueue<>(10_000);
-```
-…plus a decision: block (latency), drop-oldest with a metric (loss), or
-spill to durable storage.
-
-**Narrate aloud:** "The no-arg LinkedBlockingQueue is effectively unbounded,
-so `put` never blocks — the backpressure comment is fiction. A slow
-downstream means unbounded memory growth."
-
-**L5 commentary:** Backpressure strategy is a *product* decision, not just
-engineering: block (latency), drop (loss), persist (Kafka/SQS). For
-notifications the usual answer is bounded + drop-oldest + DLQ + a metric —
-and the metric is non-negotiable, because silent drops are silent data loss.
-
----
-
-## Bug 6 — Shared SimpleDateFormat across worker threads
-
-**Location:** `Metrics.java:20`
-```java
-String ts = TIMESTAMP.format(new Date());
-```
-
-**Why it's subtle:** `static final` suggests safe reuse, and the class looks
-immutable. But `SimpleDateFormat` keeps mutable `Calendar` state internally —
-concurrent `format()` calls corrupt each other, producing garbled timestamps
-or `NumberFormatException`/`ArrayIndexOutOfBoundsException` under load. It
-only manifests in production, never in a unit test.
-
-**Ideal fix:** `DateTimeFormatter` — immutable and thread-safe:
-```java
-private static final DateTimeFormatter TIMESTAMP =
-        DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS");
-String ts = TIMESTAMP.format(LocalDateTime.now());
-```
-
-**Narrate aloud:** "SimpleDateFormat is famously not thread-safe — its
-internal calendar is mutated by `format()`. Under 16 workers you get garbled
-timestamps or exceptions, and only under load."
-
-**L5 commentary:** The cruelest part: this corrupts *observability* data —
-the timestamps you'd use to debug everything else. Bugs in the telemetry path
-are the most expensive because they blind you during the incident they'd help
-explain. `static final` mutable objects deserve a second look, always.
-
----
-
-## Bug 7 — Swallowed interrupt: workers can never stop
+## Bug 2 — Swallowed interrupt: workers can never stop
 
 **Location:** `Dispatcher.java:41–42`
 ```java
@@ -234,15 +79,183 @@ return."
 
 **L5 commentary:** Note the inconsistency *within the same class*:
 `sendWithRetry` handles interruption correctly (re-interrupts and returns)
-while `workerLoop` doesn't. Inconsistent interrupt discipline is the tell —
-and contrast with Mock 3's `ConfigStore` poller, which does it right.
+while `workerLoop` doesn't. Inconsistent interrupt discipline is the tell.
 Uniform conventions beat local cleverness.
+
+---
+
+## Bug 3 — HashMap shared across threads (the dedup that doesn't)
+
+**Location:** `DedupStore.java:23`
+```java
+return seen.containsKey(id);
+```
+
+**Why it's subtle:** `markSent` *is* synchronized, and the comment
+rationalizes the unlocked read ("reads don't mutate"). Single-threaded tests
+pass. But `HashMap` is unsafe for *any* concurrent read/write mix: a `put`
+that triggers a resize while another thread reads can loop forever or corrupt
+the table. Worst case, the failure mode is **duplicate sends** — precisely the
+invariant this class exists to protect.
+
+**Ideal fix:** `private final Map<String, Long> seen = new ConcurrentHashMap<>();`
+(or synchronize the read — but CHM is the idiomatic answer).
+
+**Narrate aloud:** "Synchronizing only the writer doesn't help — HashMap
+isn't safe for concurrent read/write at all. A resize during a read can spin
+forever, and the failure mode is duplicate sends."
+
+**L5 commentary:** Concurrency bugs that defeat a component's *raison d'être*
+are the most expensive kind. The pattern to internalize: when the comment
+explains why the lock *isn't* needed, that's exactly where to look hardest.
+
+---
+
+## Bug 4 — Off-by-one: the retry budget allows one attempt too many
+
+**Location:** `RetryPolicy.java:30`
+```java
+return attempt <= maxAttempts;
+```
+
+**Why it's subtle:** The javadoc does the arithmetic for you — "attempts are
+0-based, so the valid attempt numbers run 0..maxAttempts inclusive" — and it
+*sounds* right. But the dispatcher's loop treats `maxAttempts` as the *count*
+of retries: with `maxAttempts = 100`, attempts 0..100 is **101 tries**, one
+more than the configured budget. The comment makes the fencepost error look
+like a deliberate spec.
+
+**Trigger:** `new RetryPolicy(1000, 100)` (the `Main` demo config) —
+`shouldRetry(100)` returns true, so a permanently-failing notification gets
+101 attempts instead of 100.
+
+**Ideal fix:**
+```java
+public boolean shouldRetry(int attempt) {
+    return attempt < maxAttempts; // 0-based: exactly maxAttempts tries
+}
+```
+
+**Narrate aloud:** "Zero-based attempt numbering with `<=` gives maxAttempts
++ 1 tries — the comment's 'inclusive' framing is the fencepost error wearing
+a spec costume."
+
+**L5 commentary:** Off-by-ones in retry budgets are how you exceed downstream
+rate limits and SLO budgets by "just one more" per notification — at scale,
+that's a multiplier on provider load. Retry budgets deserve a unit test with
+the exact boundary values, not just "retries a few times".
+
+---
+
+## Bug 5 — Backoff shift overflows to negative
+
+**Location:** `RetryPolicy.java:35`
+```java
+return baseDelayMs << attempt;
+```
+
+**Why it's subtle:** `<<` reads as a fast `2^attempt`, and with the default
+mental model of "a handful of retries" it never misbehaves. But the class
+javadoc notes ops raised the ceiling to **100 attempts** — and
+`1000 << 53` exceeds `Long.MAX_VALUE`, wrapping **negative**. `Thread.sleep`
+with a negative argument throws `IllegalArgumentException`, breaking the
+retry loop in a way no test with 3 attempts will ever show. (Bug 4's extra
+attempt makes this reachable one step sooner.)
+
+**Ideal fix:** saturating, capped backoff:
+```java
+private static final long MAX_DELAY_MS = 60_000;
+public long delayForAttempt(int attempt) {
+    long delay = baseDelayMs;
+    for (int i = 0; i < attempt && delay < MAX_DELAY_MS; i++) {
+        delay = Math.min(MAX_DELAY_MS, delay * 2);
+    }
+    return delay;
+}
+```
+
+**Narrate aloud:** "Left shift on a long wraps at 63 bits — past attempt ~53
+this goes negative and `sleep` throws. The incident-era config of 100
+attempts makes this reachable, not theoretical."
+
+**L5 commentary:** Every exponential needs a cap, and usually a *deadline*
+too: bounding attempts without bounding total elapsed time still lets one
+notification occupy a worker for hours. Ask: what's the worst-case time a
+single notification can hold a worker?
+
+---
+
+## Phase C — sketch (per-tenant rate limiting)
+
+**Approach:** add `tenantId` to `Notification`; a `TenantLimiter` holding a
+per-tenant token bucket (`ConcurrentHashMap<String, Bucket>`, buckets created
+on demand); in `workerLoop`, acquire the tenant's permit before
+`sendWithRetry` — or better, gate at dequeue time so an over-quota tenant
+doesn't starve others' workers. ~80–120 lines.
+
+**Key trade-offs:** where the wait happens matters. Blocking the worker on an
+over-quota tenant couples tenants through the shared pool (one hot tenant
+parks all 16 workers) — the senior design is a separate slow lane or
+defer-and-requeue with backoff. Permit accounting vs. the retry budget: does
+time spent waiting consume retry attempts? The dedup question: is a
+deprioritized-but-unsent id "sent"? (No — but say it out loud.)
+
+**Clarifying questions a strong candidate asks about "deprioritized":**
+1. "Deprioritized means what, operationally — delayed, dropped, DLQ'd, or a
+   separate slow lane? And is dropping *ever* acceptable for notifications?"
+2. "Are tenants known upfront or dynamic — can anyone show up with a new
+   tenant id?" (Unbounded tenant cardinality → the bucket map needs eviction,
+   same lesson as Mock 1's API-key map.)
+3. "Is the quota about downstream protection or fairness — i.e., do we shed
+   load or just smooth it?"
+
+**What good looks like:** asked at least two of the above *before* coding;
+gave the model the dedup/retry/interrupt constraints as hard requirements;
+rejected an AI suggestion (e.g. the model blocking the worker thread
+indefinitely, or using `Thread.sleep` instead of a proper bucket); compiled
+and ran a two-tenant scenario showing isolation.
+
+---
+
+## Phase D — sketch ("traffic 10x's overnight")
+
+**What breaks first:** the unbounded queue at `WorkQueue.java:37`. The
+no-arg `LinkedBlockingQueue` is effectively `Integer.MAX_VALUE` capacity, so
+`put` never blocks despite the backpressure comment — under a slow provider
+at 10x intake, producers enqueue forever until the heap dies. This is the 3
+AM page: OOM, not gradual degradation.
+
+**Second:** the retry policy has no jitter. At 10x with a flaky provider,
+every failed notification across all workers sleeps the *identical* backoff
+and wakes in lockstep — a synchronized retry wave hammering a recovering
+provider. Your retry policy and the provider's recovery become phase-locked:
+a self-inflicted DDoS after someone else's outage.
+
+**The fixes and their trade-offs:** bound the queue (`new
+LinkedBlockingQueue<>(10_000)`) and choose the overflow policy explicitly —
+block (adds latency, pushes backpressure to callers), drop-oldest with a
+metric (loss, but bounded), or spill to durable storage (Kafka/SQS, the real
+answer for notifications). Backpressure strategy is a *product* decision:
+for notifications the usual answer is bounded + drop-oldest + DLQ + a
+non-negotiable metric, because silent drops are silent data loss. Add equal
+jitter to the backoff (half fixed, half random).
+
+**L5 commentary:** The senior answer sequences the failures — OOM first
+(cliff), retry storm second (amplifier), worker pool sizing third (16 fixed
+workers at 10x = queueing delay even when healthy). Then the detection
+story: queue depth and heap growth rate are the leading indicators; by the
+time downstream latency spikes, you're already paging. And the organizational
+point: the "backpressure" comment described a design that was never built —
+comments describing nonexistent behavior are how capacity planning goes
+wrong.
 
 ---
 
 ## Scoring
 
-- 7/7 with interleavings named: exceptional.
-- 5–6/7: solid pass.
-- ≤4/7: drill concurrency reading — for each shared field, ask "who writes,
+- 5/5 with interleavings/inputs for each: exceptional.
+- 4/5: solid pass — the miss tells you what to drill.
+- ≤3/5: drill concurrency reading — for each shared field, ask "who writes,
   who reads, under what lock" before moving on.
+- Phase C is graded on process (questions → constraints → rejection →
+  verification), not on finishing. Phase D unfinished is not a fail.

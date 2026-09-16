@@ -1,8 +1,8 @@
 # Mock 1 — Tasks
 
-Work strictly in phase order. Start the 60-minute timer before Phase 1.
+Work strictly in phase order. Start the 60-minute timer before Phase A.
 
-## Phase 1 — Analyze (0:00–0:15, NO AI)
+## Phase A — Read & map (0:00–0:10, NO AI)
 
 1. Read all five files. On paper (or a blank doc), draw the component map:
    which class calls which, and what data flows between them on a
@@ -17,39 +17,52 @@ Work strictly in phase order. Start the 60-minute timer before Phase 1.
 Checkpoint: close the files. Can you describe the redirect flow from memory?
 If not, your map isn't done.
 
-## Phase 2 — Collaborate (0:15–0:30, Gemini on)
+## Phase B — Fix (0:10–0:25, AI assisted)
 
-Task: add a `DELETE /links/{code}` endpoint to `App.java` that removes the
-link from the store and the cache and returns whether anything was deleted.
+There are **5 planted bugs**, obvious-to-moderate: an off-by-smell in the
+rate limiter, a uniqueness assumption, a concurrency slip, a trust-boundary
+gap, and something the comments promise but the code never does.
 
-1. **Before prompting**, say aloud: your plan for the prompts (how many, what
-   each covers, what context Gemini needs).
-2. Prompt Gemini narrowly — one task per prompt. Suggested split:
-   - Prompt 1: "add a `remove(code)` method to `UrlStore`" (paste the class).
-   - Prompt 2: "wire it into `App` as a delete handler with the existing
-     exception style".
-3. After each response, read the diff like a reviewer: does it handle expiry?
-   the cache? thread-safety consistent with the class?
+1. Hunt them **yourself**. You may use AI for mechanical help (syntax, JDK
+   API lookup) but do not prompt it to find bugs — the finding is the test.
+2. For each: file:line, what's wrong, and a concrete input or interleaving
+   that triggers it.
+3. Fix all five with real, compiling code. Verify with `javac` in this
+   directory. (In the real round, fixing everything isn't required — but this
+   mock is the warm-up, so finish it.)
 
-## Phase 3 — Validate (0:30–0:45, Gemini on)
+## Phase C — Build (0:25–0:45, AI on)
 
-1. Go through every AI-generated line from Phase 2 and verify it against the
-   real code. Say aloud for each: "this is correct because…".
-2. Now hunt the planted bugs **yourself** — do not ask Gemini to find them.
-   There are 6. For each candidate, write: file:line, what's wrong, and a
-   concrete input or interleaving that triggers it.
-3. If Gemini offers a fix for anything, verify the fix independently before
-   accepting it.
+Implement **with AI**: expiring-link enforcement plus a click-stats endpoint.
 
-## Phase 4 — Optimize & test (0:45–1:00, Gemini on)
+Spec:
+1. `GET /{code}` on an expired link must stop redirecting (decide: 404 or
+   410 — and be ready to defend the choice).
+2. New endpoint `GET /stats/{code}` returning, for a link: total clicks and
+   **recent click activity**.
+3. "Recent click activity" is deliberately under-specified. **Before writing
+   any code, ask clarifying questions** (out loud): recent = what window?
+   Last N events? Include referrer breakdown? What does the caller actually
+   need this for?
 
-1. Pick **one** bug and fix it with real, compiling code. Verify with
-   `javac` in this directory.
-2. Write a small driver (a `main` method or plain `assert`s) that **fails
-   before your fix and passes after**. Suggested: the token-bucket refill —
-   drain the burst, sleep, and show whether permits come back.
-3. Out loud: propose one performance improvement to the codebase (not a bug
-   fix) and name its tradeoff.
+Rules for this phase:
+- **Before prompting**, say aloud your plan: how many prompts, what each
+  covers, what context the model needs.
+- Prompt narrowly — one task per prompt.
+- After each response, read the diff like a reviewer: expiry handling, cache
+  interaction, thread-safety consistent with the class.
+- **Reject at least one AI suggestion on the record**, with a reason.
+- Compile and smoke-test the result before the timer ends (~80–120 lines
+  total is the right size).
+
+## Phase D — Scale (0:45–1:00, discussion)
+
+"Traffic 10x's overnight. What breaks first, and what do you change?"
+
+1. Name the **first** bottleneck — the one that pages you at 3 AM, not the
+   fifth. Tie it to a specific line or structure in the code.
+2. Propose the fix and name its tradeoff out loud.
+3. Bonus: what metric or alert would have warned you *before* the 10x?
 
 Timer ends. Only now open `ANSWERS.md` and score yourself against the
 checklist in `INTERVIEW.md`.

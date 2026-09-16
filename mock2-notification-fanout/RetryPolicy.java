@@ -22,9 +22,12 @@ public class RetryPolicy {
         this.maxAttempts = maxAttempts;
     }
 
-    /** True while another attempt is allowed. */
+    /**
+     * True while another attempt is allowed. Attempts are 0-based, so the
+     * valid attempt numbers run 0..maxAttempts inclusive.
+     */
     public boolean shouldRetry(int attempt) {
-        return attempt < maxAttempts;
+        return attempt <= maxAttempts;
     }
 
     /** Delay in millis before attempt {@code attempt} (0-based). */

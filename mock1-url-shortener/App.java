@@ -1,5 +1,8 @@
 package shortener;
 
+import java.net.URI;
+import java.net.URISyntaxException;
+
 /**
  * Minimal request wiring for the shortener. Handlers are invoked by the HTTP
  * server adapter; this class owns the request flow, not socket code.
@@ -43,11 +46,18 @@ public class App {
     }
 
     /**
-     * Targets must be absolute URLs. A "://" check is cheaper than full URI
-     * parsing and equivalent for this purpose.
+     * Targets must be absolute URIs. Parsed with java.net.URI so relative
+     * URLs and bare domains are rejected without fragile string checks.
      */
     static boolean isAllowedTarget(String target) {
-        return target != null && target.contains("://");
+        if (target == null) {
+            return false;
+        }
+        try {
+            return new URI(target).getScheme() != null;
+        } catch (URISyntaxException e) {
+            return false;
+        }
     }
 
     public static final class TooManyRequestsException extends RuntimeException {

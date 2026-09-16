@@ -1,8 +1,8 @@
 # Mock 2 — Tasks
 
-Work strictly in phase order. Start the 60-minute timer before Phase 1.
+Work strictly in phase order. Start the 60-minute timer before Phase A.
 
-## Phase 1 — Analyze (0:00–0:15, NO AI)
+## Phase A — Read & map (0:00–0:10, NO AI)
 
 1. Read all six files. Draw the threading model on paper:
    - Which threads exist, who creates them, and what each one loops on.
@@ -20,38 +20,55 @@ Work strictly in phase order. Start the 60-minute timer before Phase 1.
 Checkpoint: can you explain, without re-reading, why a worker might never
 stop? If not, re-read `Dispatcher` before moving on.
 
-## Phase 2 — Collaborate (0:15–0:30, Gemini on)
+## Phase B — Fix (0:10–0:25, AI assisted)
 
-Task: add a dead-letter queue. After a notification exhausts its attempts,
-route it to a `DeadLetterQueue` (in-memory list is fine) instead of silently
-dropping it, and record a metric.
+There are **5 planted bugs**: a lifecycle bug, an interrupt-handling bug, a
+shared-state bug, an off-by-one in the retry budget, and a numeric bug that
+only appears under the incident-era config.
 
-1. **Before prompting**, say aloud your prompting strategy and the semantic
-   constraints Gemini must respect (dedup: is a DLQ'd id "sent"? retry
-   budget: who counts attempts?).
-2. Prompt narrowly: first the `DeadLetterQueue` class, then the wiring into
-   `sendWithRetry`, then the metric.
-3. Review each diff as the on-call owner: thread-safety, interrupt behavior,
-   and whether the DLQ path can itself lose data.
+1. Hunt them **yourself** — no "find the bugs" prompting. AI for mechanics
+   only.
+2. For each concurrency bug, name the **interleaving** that triggers it.
+   For the logic/numeric bugs, give the concrete config or input.
+3. Fix all five with real, compiling code. Verify with `javac`.
 
-## Phase 3 — Validate (0:30–0:45, Gemini on)
+## Phase C — Build (0:25–0:45, AI on)
 
-1. Verify every AI-generated line against the real code, aloud.
-2. Hunt the planted bugs **yourself**. There are 7. For each concurrency bug,
-   name the **interleaving** that triggers it — "two threads do X while a
-   third does Y". For each logic bug, give the concrete input.
-3. Verify any AI-suggested fix independently before accepting it.
+Implement **with AI**: per-tenant rate limiting in the dispatcher.
 
-## Phase 4 — Optimize & test (0:45–1:00, Gemini on)
+Spec:
+1. Each notification belongs to a tenant (you'll need to carry a tenant id
+   on `Notification`).
+2. Each tenant gets its own send budget (e.g. N sends/second, burst M).
+3. Tenants that exceed their quota are **"deprioritized"**.
+4. "Deprioritized" is deliberately under-specified. **Before writing any
+   code, ask clarifying questions** (out loud): does it mean delayed,
+   dropped, DLQ'd, or a separate slow lane? What happens to the
+   over-quota notification — and is dropping ever acceptable for
+   notifications? Are tenants known upfront or dynamic?
 
-1. Pick **one** bug and fix it with real, compiling code. Verify with
-   `javac` in this directory. Suggested: cap the backoff with jitter in
-   `RetryPolicy`.
-2. Write a driver that **fails before the fix and passes after**. Suggested:
-   call `delayForAttempt` for attempts 0–100 and assert every value is
-   within `[0, MAX]`.
-3. Out loud: propose one throughput improvement (not a bug fix) and name its
-   tradeoff — e.g. batching sends vs. per-notification latency.
+Rules for this phase:
+- **Before prompting**, say aloud your strategy and the semantic constraints
+  the model must respect (dedup: is a deprioritized id "sent"? retry budget:
+  does waiting consume attempts? interrupt discipline).
+- Prompt narrowly: tenant id plumbing first, then the limiter, then the
+  dispatcher wiring.
+- Review each diff as the on-call owner: thread-safety, what happens on
+  shutdown with a full slow lane, and whether the limiter itself can lose
+  data.
+- **Reject at least one AI suggestion on the record**, with a reason.
+- Compile and exercise the result (~80–120 lines is the right size).
+
+## Phase D — Scale (0:45–1:00, discussion)
+
+"Traffic 10x's overnight. What breaks first, and what do you change?"
+
+1. Name the **first** bottleneck — the 3 AM page. Tie it to a specific line.
+2. Propose the fix and name its tradeoff — and say *who* decides, because
+   backpressure strategy is a product call, not just engineering.
+3. Bonus: the retry policy has no jitter. Under 10x traffic with a flaky
+   provider, what does the retry pattern look like — and what does the
+   provider experience?
 
 Timer ends. Only now open `ANSWERS.md` and score yourself against the
 checklist in `INTERVIEW.md`.
